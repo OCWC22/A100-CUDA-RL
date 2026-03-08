@@ -28,25 +28,28 @@ train_image = (
         "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
         add_python="3.12",
     )
+    # Install unsloth first with its full deps so version constraints are respected.
+    # Unsloth caps: trl<=0.24.0, datasets<4.4.0, transformers<=4.57.6.
+    .pip_install(
+        "unsloth",
+        "unsloth_zoo",
+    )
     .uv_pip_install(
         "torch>=2.4",
         "torchvision>=0.19",
-        "trl==0.29.0",
-        "transformers>=4.56.2",
-        "datasets>=3.0",
+        "trl>=0.18.2,<=0.24.0",
+        "transformers>=4.51.3,<=4.57.6",
+        "datasets>=3.4.1,<4.4.0",
         "accelerate>=1.4.0",
-        "peft>=0.17.0",
+        "peft>=0.18.0",
         "Pillow>=10.0",
         "bitsandbytes>=0.45",
         "openenv-core[core]>=0.2.1",
         "numpy>=1.26",
         "httpx>=0.27",
-        "vllm>=0.10.2",
+        "vllm>=0.10.2,<=0.12.0",
         "modal>=0.70",
     )
-    # Unsloth installed separately to bypass stale trl<=0.24.0 cap.
-    # Keep this fail-fast so missing core deps are caught at image build time.
-    .run_commands("pip install --no-deps unsloth unsloth_zoo")
     .run_commands("pip install 'https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl' 2>/dev/null || true")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     .pip_install("hf_transfer")

@@ -33,6 +33,13 @@ if __package__ in {None, ""}:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
+# Import unsloth BEFORE trl/transformers so it can patch correctly.
+if sys.platform.startswith("linux"):
+    try:
+        from unsloth import FastLanguageModel, PatchFastRL  # noqa: F401
+    except ImportError:
+        pass
+
 from trl import GRPOConfig, GRPOTrainer
 
 from training.custom_grpo_trainer import TRLOOGRPOTrainer
