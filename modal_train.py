@@ -29,7 +29,7 @@ train_image = (
         add_python="3.12",
     )
     # Pin torch first so everything resolves against it.
-    .pip_install("torch==2.9.0", "torchvision==0.22.0")
+    .pip_install("torch==2.9.0", "torchvision==0.24.0")
     # Xformers as attention backend (flash-attn removed — was broken).
     .pip_install("xformers>=0.0.29")
     # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
