@@ -19,7 +19,7 @@ import modal
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "H200")
+TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100")
 APP_NAME = os.getenv("KERNELFORGE_TRAIN_APP", "kernelforge-train")
 EVAL_APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 
@@ -106,6 +106,9 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
 
     os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
+    os.environ.setdefault("KERNELFORGE_MODEL", "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled")
+    os.environ.setdefault("KERNELFORGE_LORA_R", "64")
+    os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
     if stage in {0, 1}:
         os.environ.setdefault("KERNELFORGE_SKIP_BENCHMARK", "1")
         os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
@@ -137,6 +140,7 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
         os.environ.setdefault("KERNELFORGE_BATCH_EVAL", "1")
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
         os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024")
         if max_steps is None:
             os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
         print(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import statistics
 import subprocess
 import tempfile
 from pathlib import Path
@@ -557,6 +558,32 @@ def make_multi_turn_rollout(
                 dispatch_ms=total_dispatch_ms,
                 rewards=turn_rewards,
             )
+
+            # Reward distribution diagnostics — critical for detecting dead signal
+            if turn_rewards:
+                r_mean = statistics.mean(turn_rewards)
+                r_std = statistics.stdev(turn_rewards) if len(turn_rewards) > 1 else 0.0
+                r_min = min(turn_rewards)
+                r_max = max(turn_rewards)
+                r_pos = sum(1 for r in turn_rewards if r > -1.0)
+                print(
+                    f"[rollout] reward distribution: mean={r_mean:.2f} std={r_std:.2f} "
+                    f"min={r_min:.1f} max={r_max:.1f} "
+                    f"positive={r_pos}/{len(turn_rewards)} "
+                    f"turn_total={_elapsed_ms(turn_start):.1f}ms"
+                )
+                if r_std == 0.0:
+                    print(
+                        "[rollout] WARNING: zero reward variance — GRPO will produce zero gradients. "
+                        "Check completion length, code extraction, and eval connectivity."
+                    )
+
+        # Rollout-level summary
+        print(
+            f"[rollout] complete: best_rewards={all_best_rewards} "
+            f"mean={statistics.mean(all_best_rewards):.2f} "
+            f"positive={sum(1 for r in all_best_rewards if r > -1.0)}/{len(all_best_rewards)}"
+        )
 
         return {
             "prompt_ids": all_prompt_ids,

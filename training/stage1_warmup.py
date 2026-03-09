@@ -63,7 +63,7 @@ BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
 # Multi-turn configuration
 MAX_TURNS = int(os.getenv("KERNELFORGE_STAGE1_MAX_TURNS", "3"))
 MAX_STEPS = int(os.getenv("KERNELFORGE_STAGE1_MAX_STEPS", "100"))
-MAX_COMPLETION_LENGTH = int(os.getenv("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "256"))
+MAX_COMPLETION_LENGTH = int(os.getenv("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024"))
 
 
 # --- Dataset loading ---
@@ -163,7 +163,7 @@ def main():
     config = GRPOConfig(
         learning_rate=2e-6,
         temperature=1.0,         # High exploration
-        num_generations=2,
+        num_generations=8,       # G=8 for reward variance (G=2 gave zero gradient signal)
         max_completion_length=MAX_COMPLETION_LENGTH,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,

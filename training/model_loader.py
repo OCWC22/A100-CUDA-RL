@@ -30,8 +30,8 @@ PRIMARY_MODEL = os.getenv("KERNELFORGE_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruc
 DEV_MODEL = os.getenv("KERNELFORGE_DEV_MODEL", "Qwen/Qwen2.5-Coder-0.5B-Instruct")
 
 # LoRA constants
-LORA_R = 16
-LORA_ALPHA = 16
+LORA_R = int(os.getenv("KERNELFORGE_LORA_R", "16"))
+LORA_ALPHA = int(os.getenv("KERNELFORGE_LORA_ALPHA", "16"))
 LORA_DROPOUT = 0
 
 LORA_TARGETS = [
