@@ -38,6 +38,9 @@ class TRLOOGRPOTrainer(GRPOTrainer):
         This includes sample i in its own baseline, causing (1-1/N) gradient shrinkage.
         We apply the correction after the base computation.
         """
+        if torch.isnan(rewards).any():
+            return self._compute_masked_advantages(rewards)
+
         # Let parent compute vanilla GRPO advantages
         advantages = super()._compute_advantages(rewards)
 
@@ -57,6 +60,47 @@ class TRLOOGRPOTrainer(GRPOTrainer):
         advantages = advantages * scale
 
         return advantages
+
+    def _compute_masked_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Compute group-relative advantages while masking NaN rewards."""
+        G = int(self.args.num_generations)
+        if G <= 0 or rewards.numel() % G != 0:
+            raise ValueError(
+                f"Expected rewards shaped as groups of {G}, got tensor with {rewards.numel()} elements."
+            )
+
+        grouped_rewards = rewards.view(-1, G)
+        grouped_advantages = torch.zeros_like(grouped_rewards)
+        masked_count = int(torch.isnan(grouped_rewards).sum().item())
+        eps = 1e-6
+
+        for group_idx in range(grouped_rewards.shape[0]):
+            group = grouped_rewards[group_idx]
+            valid_mask = torch.isfinite(group)
+            valid_count = int(valid_mask.sum().item())
+            if valid_count == 0:
+                continue
+
+            valid_rewards = group[valid_mask]
+            mean = valid_rewards.mean()
+            std = valid_rewards.std(unbiased=False)
+            if float(std.item()) == 0.0:
+                valid_advantages = torch.zeros_like(valid_rewards)
+            else:
+                valid_advantages = (valid_rewards - mean) / (std + eps)
+
+            if self._trloo_enabled and valid_count > 1:
+                valid_advantages = valid_advantages * (valid_count / (valid_count - 1.0))
+
+            grouped_advantages[group_idx, valid_mask] = valid_advantages
+
+        if masked_count:
+            print(
+                f"[trloo] masked_invalid_rewards={masked_count} "
+                f"groups={grouped_rewards.shape[0]} G={G}"
+            )
+
+        return grouped_advantages.view_as(rewards)
 
 
 def create_trloo_trainer(

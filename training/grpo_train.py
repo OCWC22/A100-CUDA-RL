@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(ROOT))
 
 from training.dataset_loader import load_training_dataset
+from training.model_registry import resolve_model_selection
 from training.task_support import summarize_tasks
 
 REQUIRED_PACKAGES = ("trl", "transformers", "torch")
@@ -95,6 +96,12 @@ def preflight() -> None:
                 print(f"WARNING: CoreWeave eval service not reachable at {EVAL_URL}: {exc}")
 
     summary = _dataset_summary()
+    selection = resolve_model_selection()
+    print(
+        "Resolved runtime model: "
+        f"label={selection['label']} model_id={selection['model_id']} "
+        f"source={selection['source']}"
+    )
     print("Dataset summary:")
     for key, value in summary.items():
         print(f"  {key}: {value}")
@@ -114,7 +121,15 @@ def main() -> None:
         action="store_true",
         help="Validate environment and dataset wiring without starting training",
     )
+    parser.add_argument(
+        "--model-label",
+        default="",
+        help="Registry model label from configs/scaling_ladder.json (default: KERNELFORGE_MODEL_LABEL or opus_2b)",
+    )
     args = parser.parse_args()
+
+    if args.model_label:
+        os.environ["KERNELFORGE_MODEL_LABEL"] = args.model_label
 
     preflight()
     if args.preflight_only:

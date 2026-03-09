@@ -6,7 +6,7 @@ Multi-turn agentic training via TRL's rollout_func:
   - Temperature 1.0 for exploration
   - LR 2e-6 to avoid catastrophic forgetting
   - beta=0.0 (no KL penalty — let model explore freely)
-  - G=2 generations, 100 max_steps (hackathon config)
+  - Shared GRPO config with Stage 3: G=8, max_completion_length=1024
   - vLLM disabled by default for hackathon bring-up (`KERNELFORGE_USE_VLLM=0`)
 
 Dataset: CUDA-Agent-Ops-6K easy operators (single-op subset).
@@ -44,6 +44,11 @@ from trl import GRPOConfig
 
 from training.custom_grpo_trainer import TRLOOGRPOTrainer
 from training.dataset_loader import Dataset, MiniDataset, load_training_dataset
+from training.grpo_config import (
+    apply_shared_grpo_runtime,
+    load_shared_grpo_runtime,
+    validate_shared_grpo_runtime,
+)
 from training.model_loader import load_model_and_tokenizer
 from training.multi_turn_rollout import make_multi_turn_rollout, reward_from_env
 from training.task_support import normalize_task_row
@@ -52,10 +57,7 @@ TARGET_GPU = os.getenv("KERNELFORGE_TARGET_GPU", "A100")
 TARGET_ARCH = os.getenv("KERNELFORGE_TARGET_ARCH", "sm_80")
 OUTPUT_DIR = os.getenv("KERNELFORGE_STAGE1_OUTPUT", "outputs/kernelforge-stage1")
 IS_LINUX = sys.platform.startswith("linux")
-USE_VLLM = os.getenv("KERNELFORGE_USE_VLLM", "0") == "1" and IS_LINUX
-VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("KERNELFORGE_VLLM_GPU_MEMORY_UTILIZATION", "0.6"))
-OPTIMIZER = "paged_adamw_8bit" if IS_LINUX else "adamw_torch"
-USE_BF16 = IS_LINUX
+GRPO_RUNTIME = load_shared_grpo_runtime("stage1")
 SKIP_BENCHMARK = os.getenv("KERNELFORGE_SKIP_BENCHMARK", "0") == "1"
 DEBUG_TIMINGS = os.getenv("KERNELFORGE_DEBUG_TIMINGS", "0") == "1"
 BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
@@ -63,7 +65,7 @@ BATCH_EVAL = os.getenv("KERNELFORGE_BATCH_EVAL", "0") == "1"
 # Multi-turn configuration
 MAX_TURNS = int(os.getenv("KERNELFORGE_STAGE1_MAX_TURNS", "3"))
 MAX_STEPS = int(os.getenv("KERNELFORGE_STAGE1_MAX_STEPS", "100"))
-MAX_COMPLETION_LENGTH = int(os.getenv("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024"))
+MAX_COMPLETION_LENGTH = GRPO_RUNTIME.max_completion_length
 
 
 # --- Dataset loading ---
@@ -130,7 +132,14 @@ def main():
     print(f"=== Stage 1: Multi-Turn GRPO Warm-up for {TARGET_GPU} ({TARGET_ARCH}) ===")
     print(f"  Max turns per episode: {MAX_TURNS}")
     print(f"  Max training steps: {MAX_STEPS}")
+    print(f"  Max prompt length: {GRPO_RUNTIME.max_prompt_length}")
     print(f"  Max completion length: {MAX_COMPLETION_LENGTH}")
+    print(
+        "  Shared GRPO runtime: "
+        f"G={GRPO_RUNTIME.num_generations} "
+        f"batch={GRPO_RUNTIME.per_device_train_batch_size}x{GRPO_RUNTIME.gradient_accumulation_steps} "
+        f"(effective={GRPO_RUNTIME.effective_batch_size})"
+    )
     print(
         "  Rollout mode: "
         f"skip_benchmark={SKIP_BENCHMARK} batch_eval={BATCH_EVAL} debug_timings={DEBUG_TIMINGS}"
@@ -160,26 +169,24 @@ def main():
         problem_metadata=task_rows,
     )
 
+    validate_shared_grpo_runtime(GRPO_RUNTIME)
+
     config = GRPOConfig(
-        learning_rate=2e-6,
-        temperature=1.0,         # High exploration
-        num_generations=8,       # G=8 for reward variance (G=2 gave zero gradient signal)
-        max_completion_length=MAX_COMPLETION_LENGTH,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        max_steps=MAX_STEPS,
-        optim=OPTIMIZER,
-        bf16=USE_BF16,
-        report_to="none",
-        output_dir=OUTPUT_DIR,
-        logging_steps=1,
-        top_k=50,
-        top_p=0.95,
-        repetition_penalty=1.05,
-        use_vllm=USE_VLLM,
-        vllm_mode="colocate" if USE_VLLM else "server",
-        vllm_gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
-        dataloader_num_workers=0,
+        **apply_shared_grpo_runtime(
+            GRPO_RUNTIME,
+            {
+                "learning_rate": 2e-6,
+                "temperature": 1.0,  # High exploration
+                "max_steps": MAX_STEPS,
+                "report_to": "none",
+                "output_dir": OUTPUT_DIR,
+                "logging_steps": 1,
+                "top_k": 50,
+                "top_p": 0.95,
+                "repetition_penalty": 1.05,
+                "dataloader_num_workers": 0,
+            },
+        )
     )
 
     trainer = TRLOOGRPOTrainer(

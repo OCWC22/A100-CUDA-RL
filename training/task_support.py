@@ -13,6 +13,13 @@ import os
 from collections import Counter
 from typing import Any
 
+from openenv_env.reward import (
+    COMPILE_WIN_THRESHOLD,
+    EAGER_PARITY_FLOOR,
+    EAGER_WIN_THRESHOLD,
+    compute_reward,
+)
+
 SUPPORTED_WCC_OPS = {"weakly_connected_components", "wcc"}
 STATEFUL_MODULE_TOKENS = (
     "nn.Conv",
@@ -279,6 +286,16 @@ def normalize_eval_result(result: dict[str, Any] | None) -> dict[str, Any]:
     out.setdefault("error", "")
     out.setdefault("trace_id", "")
     out.setdefault("task_id", "")
+    out.setdefault("backend_error", False)
+    out.setdefault("runtime_error", False)
+    out.setdefault("valid_for_loss", True)
+    out.setdefault("termination_reason", "")
+    out.setdefault("truncated", False)
+    out.setdefault("extraction_status", "ok")
+    out.setdefault("local_compile_ok", True)
+    out.setdefault("remote_compile_ok", bool(out.get("compiles")))
+    out.setdefault("public_reward_bucket", None)
+    out.setdefault("training_reward", None)
     out.setdefault("phase_timings", {
         "compile_ms": 0.0,
         "correctness_ms": 0.0,
@@ -287,23 +304,159 @@ def normalize_eval_result(result: dict[str, Any] | None) -> dict[str, Any]:
         "benchmark_kernel_ms": 0.0,
         "total_eval_ms": 0.0,
     })
+    out["speedup_vs_orig"] = float(out.get("speedup_vs_orig") or 0.0)
+    out["speedup_vs_dg"] = float(out.get("speedup_vs_dg") or 0.0)
+    out["speedup_vs_eager"] = float(out.get("speedup_vs_eager") or out["speedup_vs_orig"])
+    out["speedup_vs_compile"] = float(out.get("speedup_vs_compile") or out["speedup_vs_dg"])
     return out
 
 
-def compute_task_reward(result: dict[str, Any] | None) -> float:
-    """Compute the canonical reward from a normalized evaluator result."""
-    from openenv_env.reward import compute_reward
+def _is_backend_error(normalized: dict[str, Any]) -> bool:
+    if bool(normalized.get("backend_error")):
+        return True
+    error_text = " ".join(
+        str(normalized.get(key, "") or "").lower()
+        for key in ("error", "verifier_msg")
+    )
+    return any(
+        token in error_text
+        for token in (
+            "missing batch result",
+            "dispatch failed",
+            "http",
+            "connection",
+            "backend",
+            "modal",
+            "coreweave",
+            "timed out",
+            "timeout",
+            "malformed",
+            "reference model load failed",
+        )
+    )
+
+
+def _is_runtime_error(normalized: dict[str, Any]) -> bool:
+    if bool(normalized.get("runtime_error")):
+        return True
+    error_text = " ".join(
+        str(normalized.get(key, "") or "").lower()
+        for key in ("error", "verifier_msg")
+    )
+    return any(
+        token in error_text
+        for token in (
+            "benchmark exception",
+            "profiling failed",
+            "runtime error",
+            "illegal memory access",
+            "launch failed",
+            "cuda error",
+        )
+    )
+
+
+def build_reward_contract(
+    result: dict[str, Any] | None,
+    *,
+    truncated: bool = False,
+    extraction_status: str = "ok",
+    local_compile_ok: bool = True,
+    supports_evaluation: bool = True,
+    backend_error: bool | None = None,
+) -> dict[str, Any]:
+    """Map rollout + evaluator status into dense training reward + public bucket."""
 
     normalized = normalize_eval_result(result)
-    return compute_reward(
-        compiled=bool(normalized.get("compiles")),
-        correct=bool(normalized.get("correct")),
-        speedup_vs_eager=float(normalized.get("speedup_vs_orig") or 0.0),
-        speedup_vs_compile=float(normalized.get("speedup_vs_dg") or 0.0),
-        occupancy=normalized.get("occupancy"),
-        mem_coalescing=normalized.get("mem_coalescing"),
-        warp_efficiency=normalized.get("warp_efficiency"),
+    normalized["truncated"] = bool(truncated or normalized.get("truncated"))
+    normalized["extraction_status"] = extraction_status or str(normalized.get("extraction_status") or "ok")
+    normalized["local_compile_ok"] = bool(local_compile_ok and normalized.get("local_compile_ok", True))
+    normalized["remote_compile_ok"] = bool(normalized.get("compiles"))
+    normalized["backend_error"] = _is_backend_error(normalized) if backend_error is None else bool(backend_error)
+    normalized["runtime_error"] = _is_runtime_error(normalized)
+
+    if normalized["backend_error"]:
+        normalized["valid_for_loss"] = False
+        normalized["termination_reason"] = "backend_error"
+        normalized["training_reward"] = None
+        normalized["public_reward_bucket"] = None
+        return normalized
+
+    if normalized["extraction_status"] == "no_code":
+        normalized["termination_reason"] = "no_code"
+        normalized["training_reward"] = -1.0
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    if normalized["extraction_status"] == "truncated_partial":
+        normalized["termination_reason"] = "truncated_partial"
+        normalized["training_reward"] = -0.7
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    if not supports_evaluation:
+        normalized["termination_reason"] = "unsupported"
+        normalized["training_reward"] = -1.0
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    if not normalized["local_compile_ok"]:
+        normalized["termination_reason"] = "local_compile_fail"
+        normalized["training_reward"] = -0.5
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    if not normalized["remote_compile_ok"]:
+        normalized["termination_reason"] = "remote_compile_fail"
+        normalized["training_reward"] = -0.4
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    if normalized["runtime_error"]:
+        normalized["termination_reason"] = "runtime_error"
+        normalized["training_reward"] = -0.3
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    if not bool(normalized.get("correct")):
+        normalized["termination_reason"] = "correctness_fail"
+        normalized["training_reward"] = -0.2
+        normalized["public_reward_bucket"] = -1
+        return normalized
+
+    speedup_vs_eager = float(normalized.get("speedup_vs_eager") or 0.0)
+    speedup_vs_compile = float(normalized.get("speedup_vs_compile") or 0.0)
+    normalized["public_reward_bucket"] = int(
+        compute_reward(
+            compiled=True,
+            correct=True,
+            speedup_vs_eager=speedup_vs_eager,
+            speedup_vs_compile=speedup_vs_compile,
+            occupancy=normalized.get("occupancy"),
+            mem_coalescing=normalized.get("mem_coalescing"),
+            warp_efficiency=normalized.get("warp_efficiency"),
+        )
     )
+
+    if speedup_vs_compile > COMPILE_WIN_THRESHOLD:
+        normalized["termination_reason"] = "correct_fast_compile"
+        normalized["training_reward"] = 1.0
+    elif speedup_vs_eager > EAGER_WIN_THRESHOLD:
+        normalized["termination_reason"] = "correct_fast_eager"
+        normalized["training_reward"] = 0.7
+    elif speedup_vs_eager >= EAGER_PARITY_FLOOR:
+        normalized["termination_reason"] = "correct_parity"
+        normalized["training_reward"] = 0.4
+    else:
+        normalized["termination_reason"] = "correct_slow"
+        normalized["training_reward"] = 0.2
+
+    return normalized
+
+
+def compute_task_reward(result: dict[str, Any] | None) -> float | None:
+    """Compute the dense training reward from a normalized evaluator result."""
+    return build_reward_contract(result).get("training_reward")
 
 
 def evaluate_code_remote(
@@ -326,7 +479,9 @@ def evaluate_code_remote(
         trace_id=trace_id,
     )
     result = normalize_eval_result(dispatch_eval(fn_name, payload))
-    result["reward"] = compute_task_reward(result)
+    contract = build_reward_contract(result)
+    result.update(contract)
+    result["reward"] = contract.get("training_reward")
     result["evaluation_backend"] = normalize_task_row(task_row)["evaluation_backend"]
     return result
 
@@ -364,10 +519,13 @@ def evaluate_code_remote_batch(
         raw = raw_results[idx] if idx < len(raw_results) else {
             "compiles": False,
             "correct": False,
+            "backend_error": True,
             "error": "Missing batch result from evaluator",
         }
         result = normalize_eval_result(raw)
-        result["reward"] = compute_task_reward(result)
+        contract = build_reward_contract(result)
+        result.update(contract)
+        result["reward"] = contract.get("training_reward")
         result["evaluation_backend"] = row["evaluation_backend"]
         results.append(result)
     return results

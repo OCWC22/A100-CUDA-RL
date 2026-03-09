@@ -393,7 +393,7 @@ A100-Kernel-RL/
 │   ├── stage1_warmup.py            # GRPO warmup (100 steps, T=1.0)
 │   ├── stage2_rft.py               # RFT filtering + SFT
 │   ├── stage3_grpo.py              # GRPO pilot (50 steps, T=0.7)
-│   ├── model_loader.py             # Unsloth + LoRA (Qwen3.5-2B default, configurable via KERNELFORGE_MODEL)
+│   ├── model_loader.py             # Unsloth + LoRA (registry-driven via KERNELFORGE_MODEL_LABEL, exact override via KERNELFORGE_MODEL)
 │   ├── custom_grpo_trainer.py      # TRLOOGRPOTrainer — N/(N-1) correction
 │   ├── multi_turn_rollout.py       # 3-turn rollout with local compile fast-path
 │   ├── curriculum.py               # 4-phase curriculum (single_ops → advanced)
@@ -787,7 +787,7 @@ ls skydiscover/  # SkyDiscover repo
 
 **Current status (March 8): Done — verified on Modal A100**
 - The codebase now has a working preflight path in `training/grpo_train.py`, and that preflight passes locally under `uv` with the current repo assets.
-- A100 80GB ($2.50/hr) is the training and eval GPU. `modal_train.py` defaults to `KERNELFORGE_TRAIN_GPU=A100` and `KERNELFORGE_MODEL=Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled`.
+- A100 80GB ($2.50/hr) is the training and eval GPU. `modal_train.py` defaults to `KERNELFORGE_TRAIN_GPU=A100` and `KERNELFORGE_MODEL_LABEL=opus_2b` (resolved through `configs/scaling_ladder.json`, with `KERNELFORGE_MODEL` preserved as an exact HF override).
 - Modal image build and smoke test have been validated. Training pipeline runs end-to-end.
 
 **Subtask 0.2.1: Install Python packages (handled by Modal image)**
@@ -1290,7 +1290,7 @@ Run tests 01-08 from the validation/ directory (see previous response for all te
 | test_07_compilation_rate.py | Base model CUDA compilation rate (target: >50%) | INFORMATIONAL |
 | test_08_full_grpo_step.py | Complete GRPO step with real evaluation | YES |
 
-**In test_05, use Qwen3.5-2B (or set via KERNELFORGE_MODEL):**
+**In test_05, use Qwen3.5-2B (or set via `KERNELFORGE_MODEL_LABEL=opus_2b`; keep `KERNELFORGE_MODEL` for exact overrides):**
 ```python
 model, tokenizer = FastLanguageModel.from_pretrained(
     "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled",

@@ -13,6 +13,7 @@ import re
 import statistics
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
@@ -23,6 +24,7 @@ from training.run_metadata import utc_timestamp_rfc3339
 from training.task_support import (
     build_generation_prompt,
     build_prompt_lookup,
+    build_reward_contract,
     compute_task_reward,
     evaluate_code_remote,
     evaluate_code_remote_batch,
@@ -53,6 +55,43 @@ def extract_cuda_code(text: str) -> str:
     if re.search(r"__global__\s+void\s+\w+", text) or "PYBIND11_MODULE" in text:
         return text.strip()
     return ""
+
+
+def _completion_was_truncated(output: dict[str, Any], max_completion_length: int) -> bool:
+    """Best-effort truncation detection from completion token count."""
+    completion_ids = output.get("completion_ids") or []
+    return len(completion_ids) >= max_completion_length
+
+
+def _update_turn_diagnostics(counter: Counter[str], contract: dict[str, Any]) -> None:
+    """Accumulate rollout diagnostics for one scored terminal turn."""
+    if not contract.get("valid_for_loss", True):
+        counter["masked_infra_invalid"] += 1
+        return
+
+    extraction_status = str(contract.get("extraction_status") or "ok")
+    if extraction_status == "no_code":
+        counter["extraction_fail"] += 1
+    if extraction_status == "truncated_partial" or contract.get("truncated"):
+        counter["truncated"] += 1
+
+    reason = str(contract.get("termination_reason") or "")
+    if reason == "local_compile_fail":
+        counter["local_compile_fail"] += 1
+    elif reason == "remote_compile_fail":
+        counter["remote_compile_fail"] += 1
+    elif reason == "runtime_error":
+        counter["runtime_error"] += 1
+    elif reason == "correctness_fail":
+        counter["correctness_fail"] += 1
+    elif reason == "correct_slow":
+        counter["correct_slow"] += 1
+    elif reason == "correct_parity":
+        counter["correct_parity"] += 1
+    elif reason == "correct_fast_eager":
+        counter["correct_fast_eager"] += 1
+    elif reason == "correct_fast_compile":
+        counter["correct_fast_compile"] += 1
 
 
 def _append_rollout_log(record: dict[str, Any]) -> None:
@@ -107,8 +146,8 @@ def _local_compile_check(code: str) -> tuple[bool, str]:
         return True, ""
 
 
-def _compute_reward_from_result(result: dict) -> float:
-    """Compute discrete milestone reward from evaluation result."""
+def _compute_reward_from_result(result: dict) -> float | None:
+    """Compute dense training reward from evaluation result."""
     return compute_task_reward(result)
 
 
@@ -140,12 +179,12 @@ def _format_feedback(result: dict, reward: float, turn: int) -> str:
                 f"std={float(stats.get('std', 0.0)):.3f}ms"
             )
 
-        if reward <= 1.0:
+        if reward <= 0.4:
             parts.append(
                 "Kernel is correct but not faster than eager PyTorch. "
                 "Try reducing memory traffic or using shared memory tiling."
             )
-        elif reward <= 2.0:
+        elif reward <= 0.7:
             parts.append(
                 "Faster than eager PyTorch but not torch.compile. Push toward "
                 "beating torch.compile with better occupancy or warp-level primitives."
@@ -305,10 +344,18 @@ def make_multi_turn_rollout(
             required=_needs_wcc_baselines(task_rows)
         )
 
-        all_prompt_ids: list[list[int]] = [[] for _ in prompts]
-        all_completion_ids: list[list[int]] = [[] for _ in prompts]
-        all_logprobs: list[list[float]] = [[] for _ in prompts]
-        all_best_rewards: list[float] = [-1.0] * len(prompts)
+        max_completion_length = int(getattr(trainer.args, "max_completion_length", 2048))
+        terminal_prompt_ids: list[list[int]] = [[] for _ in prompts]
+        terminal_completion_ids: list[list[int]] = [[] for _ in prompts]
+        terminal_logprobs: list[list[float]] = [[] for _ in prompts]
+        terminal_rewards: list[float | None] = [None] * len(prompts)
+        terminal_contracts: list[dict[str, Any]] = [
+            build_reward_contract(
+                {"backend_error": True, "error": "Rollout not scored"},
+                backend_error=True,
+            )
+            for _ in prompts
+        ]
         done = [False] * len(prompts)
 
         def finalize_prompt(
@@ -316,15 +363,23 @@ def make_multi_turn_rollout(
             turn_idx: int,
             trace_id: str,
             result: dict[str, Any],
-            reward: float,
+            contract: dict[str, Any],
+            sample: dict[str, Any],
+            turn_diagnostics: Counter[str],
             local_compile_ms: float,
             dispatch_ms: float,
             turn_start: float,
         ) -> None:
-            normalized_result = normalize_eval_result(result)
+            normalized_result = normalize_eval_result({**result, **contract})
             task_row = task_rows[prompt_idx]
-            if reward > all_best_rewards[prompt_idx]:
-                all_best_rewards[prompt_idx] = reward
+            reward = normalized_result.get("training_reward")
+
+            terminal_prompt_ids[prompt_idx] = list(sample.get("prompt_ids") or [])
+            terminal_completion_ids[prompt_idx] = list(sample.get("completion_ids") or [])
+            terminal_logprobs[prompt_idx] = list(sample.get("logprobs") or [])
+            terminal_rewards[prompt_idx] = reward
+            terminal_contracts[prompt_idx] = normalized_result
+            _update_turn_diagnostics(turn_diagnostics, normalized_result)
 
             _append_rollout_log(
                 {
@@ -334,6 +389,11 @@ def make_multi_turn_rollout(
                     "task_id": task_row.get("task_id", ""),
                     "evaluation_backend": task_row.get("evaluation_backend"),
                     "reward": reward,
+                    "public_reward_bucket": normalized_result.get("public_reward_bucket"),
+                    "valid_for_loss": normalized_result.get("valid_for_loss"),
+                    "termination_reason": normalized_result.get("termination_reason"),
+                    "truncated": normalized_result.get("truncated"),
+                    "extraction_status": normalized_result.get("extraction_status"),
                     "compiles": bool(normalized_result.get("compiles")),
                     "correct": bool(normalized_result.get("correct")),
                     "runtime_ms": float(normalized_result.get("runtime_ms", 0.0) or 0.0),
@@ -357,11 +417,15 @@ def make_multi_turn_rollout(
                     f"eval={phase_timings}"
                 )
 
-            if reward >= 3.0 or turn_idx == max_turns - 1:
+            if (
+                not normalized_result.get("valid_for_loss", True)
+                or normalized_result.get("public_reward_bucket") in {1, 2, 3}
+                or turn_idx == max_turns - 1
+            ):
                 done[prompt_idx] = True
                 return
 
-            feedback = _format_feedback(normalized_result, reward, turn_idx)
+            feedback = _format_feedback(normalized_result, float(reward or -1.0), turn_idx)
             current_prompts[prompt_idx] = base_prompts[prompt_idx] + f"\n\n{feedback}"
 
         for turn in range(max_turns):
@@ -382,85 +446,127 @@ def make_multi_turn_rollout(
             print(f"[rollout] turn {turn + 1}/{max_turns} generation complete in {generation_ms:.1f}ms")
 
             pending_jobs: list[dict[str, Any]] = []
-            turn_rewards: list[float] = []
+            turn_rewards: list[float | None] = []
+            turn_diagnostics: Counter[str] = Counter()
             total_dispatch_ms = 0.0
 
             for output_idx, prompt_idx in enumerate(active_indices):
                 outputs_for_prompt = outputs[output_idx]
-                all_prompt_ids[prompt_idx].extend(outputs_for_prompt["prompt_ids"])
-                all_completion_ids[prompt_idx].extend(outputs_for_prompt["completion_ids"])
-                all_logprobs[prompt_idx].extend(outputs_for_prompt["logprobs"])
+                sample = {
+                    "prompt_ids": list(outputs_for_prompt.get("prompt_ids") or []),
+                    "completion_ids": list(outputs_for_prompt.get("completion_ids") or []),
+                    "logprobs": list(outputs_for_prompt.get("logprobs") or []),
+                }
 
                 completion_text = outputs_for_prompt.get("text") or tokenizer.decode(
                     outputs_for_prompt["completion_ids"], skip_special_tokens=True
                 )
                 trace_id = uuid4().hex
                 local_compile_ms = 0.0
+                completion_truncated = _completion_was_truncated(
+                    outputs_for_prompt,
+                    max_completion_length=max_completion_length,
+                )
+                task_row = task_rows[prompt_idx]
+                supports_evaluation = bool(task_row.get("supports_evaluation"))
 
                 code = extract_cuda_code(completion_text)
                 if not code:
-                    reward = -1.0
                     result = {
                         "compiles": False,
                         "correct": False,
                         "trace_id": trace_id,
-                        "task_id": task_rows[prompt_idx].get("task_id", ""),
+                        "task_id": task_row.get("task_id", ""),
                         "error": (
                             "No valid CUDA/C++ code was found. Return a fenced code block "
                             "or a raw CUDA extension source file."
                         ),
                     }
-                    finalize_prompt(prompt_idx, turn, trace_id, result, reward, 0.0, 0.0, turn_start)
-                    turn_rewards.append(reward)
+                    contract = build_reward_contract(
+                        result,
+                        truncated=completion_truncated,
+                        extraction_status="truncated_partial" if completion_truncated else "no_code",
+                        local_compile_ok=True,
+                        supports_evaluation=supports_evaluation,
+                    )
+                    finalize_prompt(
+                        prompt_idx,
+                        turn,
+                        trace_id,
+                        result,
+                        contract,
+                        sample,
+                        turn_diagnostics,
+                        0.0,
+                        0.0,
+                        turn_start,
+                    )
+                    turn_rewards.append(contract.get("training_reward"))
                     continue
 
                 local_compile_start = perf_counter()
                 compiles_locally, compile_err = _local_compile_check(code)
                 local_compile_ms = _elapsed_ms(local_compile_start)
                 if not compiles_locally:
-                    reward = -1.0
                     result = {
                         "compiles": False,
                         "correct": False,
                         "trace_id": trace_id,
-                        "task_id": task_rows[prompt_idx].get("task_id", ""),
+                        "task_id": task_row.get("task_id", ""),
                         "error": compile_err[:200],
                     }
+                    contract = build_reward_contract(
+                        result,
+                        truncated=completion_truncated,
+                        extraction_status="truncated_partial" if completion_truncated else "ok",
+                        local_compile_ok=False,
+                        supports_evaluation=supports_evaluation,
+                    )
                     finalize_prompt(
                         prompt_idx,
                         turn,
                         trace_id,
                         result,
-                        reward,
+                        contract,
+                        sample,
+                        turn_diagnostics,
                         local_compile_ms,
                         0.0,
                         turn_start,
                     )
-                    turn_rewards.append(reward)
+                    turn_rewards.append(contract.get("training_reward"))
                     continue
 
-                if not task_rows[prompt_idx].get("supports_evaluation"):
-                    reward = -1.0
+                if not supports_evaluation:
                     result = {
                         "compiles": False,
                         "correct": False,
                         "trace_id": trace_id,
-                        "task_id": task_rows[prompt_idx].get("task_id", ""),
-                        "error": task_rows[prompt_idx].get(
+                        "task_id": task_row.get("task_id", ""),
+                        "error": task_row.get(
                             "support_reason", "Unsupported evaluation backend"
                         ),
                     }
+                    contract = build_reward_contract(
+                        result,
+                        truncated=completion_truncated,
+                        extraction_status="ok",
+                        local_compile_ok=True,
+                        supports_evaluation=False,
+                    )
                     finalize_prompt(
                         prompt_idx,
                         turn,
                         trace_id,
                         result,
-                        reward,
+                        contract,
+                        sample,
+                        turn_diagnostics,
                         local_compile_ms,
                         0.0,
                         turn_start,
                     )
-                    turn_rewards.append(reward)
+                    turn_rewards.append(contract.get("training_reward"))
                     continue
 
                 pending_jobs.append(
@@ -469,7 +575,9 @@ def make_multi_turn_rollout(
                         "trace_id": trace_id,
                         "code": code,
                         "local_compile_ms": local_compile_ms,
-                        "task_row": task_rows[prompt_idx],
+                        "task_row": task_row,
+                        "sample": sample,
+                        "truncated": completion_truncated,
                     }
                 )
 
@@ -491,6 +599,7 @@ def make_multi_turn_rollout(
                                 {
                                     "compiles": False,
                                     "correct": False,
+                                    "backend_error": True,
                                     "trace_id": job["trace_id"],
                                     "task_id": job["task_row"].get("task_id", ""),
                                     "error": str(exc)[:200],
@@ -501,18 +610,35 @@ def make_multi_turn_rollout(
                     total_dispatch_ms = _elapsed_ms(dispatch_start)
 
                     for job, result in zip(pending_jobs, batch_results):
-                        reward = float(result.get("reward", _compute_reward_from_result(result)))
+                        extraction_status = (
+                            "truncated_partial"
+                            if job["truncated"] and not result.get("compiles")
+                            else str(result.get("extraction_status") or "ok")
+                        )
+                        contract = build_reward_contract(
+                            result,
+                            truncated=bool(job["truncated"]),
+                            extraction_status=extraction_status,
+                            local_compile_ok=True,
+                            supports_evaluation=bool(job["task_row"].get("supports_evaluation")),
+                            backend_error=result.get("backend_error"),
+                        )
+                        result = dict(result)
+                        result.update(contract)
+                        result["reward"] = contract.get("training_reward")
                         finalize_prompt(
                             job["prompt_idx"],
                             turn,
                             job["trace_id"],
                             result,
-                            reward,
+                            contract,
+                            job["sample"],
+                            turn_diagnostics,
                             job["local_compile_ms"],
                             total_dispatch_ms,
                             turn_start,
                         )
-                        turn_rewards.append(reward)
+                        turn_rewards.append(contract.get("training_reward"))
                 else:
                     for job in pending_jobs:
                         dispatch_start = perf_counter()
@@ -530,24 +656,42 @@ def make_multi_turn_rollout(
                             result = {
                                 "compiles": False,
                                 "correct": False,
+                                "backend_error": True,
                                 "trace_id": job["trace_id"],
                                 "task_id": job["task_row"].get("task_id", ""),
                                 "error": str(exc)[:200],
                             }
                         dispatch_ms = _elapsed_ms(dispatch_start)
                         total_dispatch_ms += dispatch_ms
-                        reward = float(result.get("reward", _compute_reward_from_result(result)))
+                        extraction_status = (
+                            "truncated_partial"
+                            if job["truncated"] and not result.get("compiles")
+                            else str(result.get("extraction_status") or "ok")
+                        )
+                        contract = build_reward_contract(
+                            result,
+                            truncated=bool(job["truncated"]),
+                            extraction_status=extraction_status,
+                            local_compile_ok=True,
+                            supports_evaluation=bool(job["task_row"].get("supports_evaluation")),
+                            backend_error=result.get("backend_error"),
+                        )
+                        result = dict(result)
+                        result.update(contract)
+                        result["reward"] = contract.get("training_reward")
                         finalize_prompt(
                             job["prompt_idx"],
                             turn,
                             job["trace_id"],
                             result,
-                            reward,
+                            contract,
+                            job["sample"],
+                            turn_diagnostics,
                             job["local_compile_ms"],
                             dispatch_ms,
                             turn_start,
                         )
-                        turn_rewards.append(reward)
+                        turn_rewards.append(contract.get("training_reward"))
 
             _print_turn_summary(
                 turn=turn + 1,
@@ -556,48 +700,92 @@ def make_multi_turn_rollout(
                 remote_count=len(pending_jobs),
                 generation_ms=generation_ms,
                 dispatch_ms=total_dispatch_ms,
-                rewards=turn_rewards,
+                rewards=[float(reward) for reward in turn_rewards if reward is not None],
             )
 
             # Reward distribution diagnostics — critical for detecting dead signal
             if turn_rewards:
-                r_mean = statistics.mean(turn_rewards)
-                r_std = statistics.stdev(turn_rewards) if len(turn_rewards) > 1 else 0.0
-                r_min = min(turn_rewards)
-                r_max = max(turn_rewards)
-                r_pos = sum(1 for r in turn_rewards if r > -1.0)
+                valid_turn_rewards = [float(reward) for reward in turn_rewards if reward is not None]
+                valid_fraction = len(valid_turn_rewards) / len(turn_rewards)
+                diagnostic_order = [
+                    "masked_infra_invalid",
+                    "extraction_fail",
+                    "truncated",
+                    "local_compile_fail",
+                    "remote_compile_fail",
+                    "runtime_error",
+                    "correctness_fail",
+                    "correct_slow",
+                    "correct_parity",
+                    "correct_fast_eager",
+                    "correct_fast_compile",
+                ]
+                diag_preview = " ".join(
+                    f"{key}={turn_diagnostics[key]}"
+                    for key in diagnostic_order
+                    if turn_diagnostics.get(key, 0)
+                )
+                print(
+                    f"[rollout] diagnostics: valid_fraction={valid_fraction:.2f} "
+                    f"{diag_preview or 'no_events=1'}"
+                )
+
+                if not valid_turn_rewards:
+                    print("[rollout] no_learning_step=1 reason=all_rewards_masked")
+                    continue
+
+                r_mean = statistics.mean(valid_turn_rewards)
+                r_std = statistics.stdev(valid_turn_rewards) if len(valid_turn_rewards) > 1 else 0.0
+                r_min = min(valid_turn_rewards)
+                r_max = max(valid_turn_rewards)
+                r_pos = sum(1 for r in valid_turn_rewards if r > 0.0)
                 print(
                     f"[rollout] reward distribution: mean={r_mean:.2f} std={r_std:.2f} "
                     f"min={r_min:.1f} max={r_max:.1f} "
-                    f"positive={r_pos}/{len(turn_rewards)} "
+                    f"positive={r_pos}/{len(valid_turn_rewards)} "
                     f"turn_total={_elapsed_ms(turn_start):.1f}ms"
                 )
                 if r_std == 0.0:
                     print(
                         "[rollout] WARNING: zero reward variance — GRPO will produce zero gradients. "
-                        "Check completion length, code extraction, and eval connectivity."
+                        "Check completion length, code extraction, and eval connectivity. "
+                        "no_learning_step=1 reason=zero_reward_variance"
                     )
 
         # Rollout-level summary
-        print(
-            f"[rollout] complete: best_rewards={all_best_rewards} "
-            f"mean={statistics.mean(all_best_rewards):.2f} "
-            f"positive={sum(1 for r in all_best_rewards if r > -1.0)}/{len(all_best_rewards)}"
-        )
+        valid_terminal_rewards = [float(reward) for reward in terminal_rewards if reward is not None]
+        valid_fraction = len(valid_terminal_rewards) / len(terminal_rewards) if terminal_rewards else 0.0
+        if valid_terminal_rewards:
+            print(
+                f"[rollout] complete: terminal_rewards={terminal_rewards} "
+                f"mean={statistics.mean(valid_terminal_rewards):.2f} "
+                f"valid_fraction={valid_fraction:.2f} "
+                f"positive={sum(1 for r in valid_terminal_rewards if r > 0.0)}/{len(valid_terminal_rewards)}"
+            )
+        else:
+            print(
+                f"[rollout] complete: terminal_rewards={terminal_rewards} "
+                f"valid_fraction={valid_fraction:.2f} "
+                "no_learning_step=1 reason=all_terminal_rewards_masked"
+            )
 
         return {
-            "prompt_ids": all_prompt_ids,
-            "completion_ids": all_completion_ids,
-            "logprobs": all_logprobs,
-            "env_reward": all_best_rewards,
+            "prompt_ids": terminal_prompt_ids,
+            "completion_ids": terminal_completion_ids,
+            "logprobs": terminal_logprobs,
+            "env_reward": terminal_rewards,
+            "env_reward_contract": terminal_contracts,
         }
 
     return rollout_func
 
 
 def reward_from_env(completions: list[str], **kwargs: Any) -> list[float]:
-    """Extract the rewards produced by rollout_func."""
+    """Extract rollout rewards, using NaN to mask infra-invalid samples."""
     env_rewards = kwargs.get("env_reward", [])
     if env_rewards:
-        return [float(reward) for reward in env_rewards]
+        return [
+            float("nan") if reward is None else float(reward)
+            for reward in env_rewards
+        ]
     return [-1.0] * len(completions)

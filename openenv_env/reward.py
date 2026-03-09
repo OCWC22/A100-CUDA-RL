@@ -9,6 +9,9 @@ from __future__ import annotations
 import math
 
 _REQUIRED_EVAL_KEYS = {"compiles", "correct", "speedup_vs_orig", "speedup_vs_dg", "error"}
+EAGER_PARITY_FLOOR = 0.98
+EAGER_WIN_THRESHOLD = 1.05
+COMPILE_WIN_THRESHOLD = 1.05
 
 
 def validate_eval_result(result: dict) -> dict:
@@ -62,9 +65,9 @@ def compute_reward(
         return -1.0
 
     # Discrete milestones (highest matching tier wins)
-    if speedup_vs_compile > 1.05:
+    if speedup_vs_compile > COMPILE_WIN_THRESHOLD:
         return 3.0
-    if speedup_vs_eager > 1.05:
+    if speedup_vs_eager > EAGER_WIN_THRESHOLD:
         return 2.0
     return 1.0
 

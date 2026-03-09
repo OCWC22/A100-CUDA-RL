@@ -1,8 +1,9 @@
 """
 Modal training app — runs the 3-stage GRPO pipeline on cloud GPU.
 
-Default: H200 (141GB, $4.54/hr on Modal). bf16 for Qwen3-Coder-30B-A3B-Instruct via Unsloth.
-A100 (Modal) handles all eval/reward. You cannot optimize A100 perf by measuring on H200.
+Default: A100 80GB training and eval, with the runtime model resolved from
+configs/scaling_ladder.json via KERNELFORGE_MODEL_LABEL.
+Override KERNELFORGE_TRAIN_GPU to keep the H100 or H200 training path available.
 
 Usage:
     # Stage 1 warmup (default)
@@ -59,6 +60,7 @@ train_image = (
     .add_local_python_source(
         "training", "openenv_env", "evaluation", "verification",
     )
+    .add_local_dir("configs", remote_path="/root/configs")
     .add_local_dir("datasets", remote_path="/root/datasets")
     .add_local_dir("docs/research/doublegraph", remote_path="/root/docs/research/doublegraph")
     .add_local_dir("archive/datasets_legacy", remote_path="/root/archive/datasets_legacy")
@@ -83,7 +85,12 @@ hf_cache_vol = modal.Volume.from_name("kernelforge-hf-cache", create_if_missing=
     },
     include_source=True,
 )
-def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
+def train(
+    stage: int = 1,
+    max_steps: int | None = None,
+    dry_run: bool = False,
+    model_label: str | None = None,
+):
     """Run a training stage on Modal GPU.
 
     Args:
@@ -106,7 +113,9 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
 
     os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
-    os.environ.setdefault("KERNELFORGE_MODEL", "Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled")
+    if model_label:
+        os.environ["KERNELFORGE_MODEL_LABEL"] = model_label
+    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_2b")
     os.environ.setdefault("KERNELFORGE_LORA_R", "64")
     os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
     if stage in {0, 1}:
@@ -157,6 +166,15 @@ def train(stage: int = 1, max_steps: int | None = None, dry_run: bool = False):
 
     if max_steps is not None:
         os.environ[f"KERNELFORGE_STAGE{stage}_MAX_STEPS"] = str(max_steps)
+
+    from training.model_registry import resolve_model_selection
+
+    selection = resolve_model_selection()
+    print(
+        "Resolved runtime model: "
+        f"label={selection['label']} model_id={selection['model_id']} "
+        f"source={selection['source']}"
+    )
 
     try:
         if stage == 1:
@@ -321,11 +339,21 @@ def _dry_run_stage1() -> dict:
 
 
 @app.local_entrypoint()
-def main(stage: int = 1, max_steps: int = 0, dry_run: bool = False):
+def main(
+    stage: int = 1,
+    max_steps: int = 0,
+    dry_run: bool = False,
+    model_label: str = "",
+):
     """CLI entrypoint: modal run --detach modal_train.py --stage 1 --max-steps 10
 
     IMPORTANT: Always use --detach to prevent client disconnects from killing the run.
     """
     steps = max_steps if max_steps > 0 else None
-    result = train.remote(stage=stage, max_steps=steps, dry_run=dry_run)
+    result = train.remote(
+        stage=stage,
+        max_steps=steps,
+        dry_run=dry_run,
+        model_label=model_label or None,
+    )
     print(f"\nResult: {result}")

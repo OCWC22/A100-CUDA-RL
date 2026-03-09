@@ -1,21 +1,22 @@
-"""
-Unified model loading for KernelForge training pipeline.
+"""Unified model loading for the KernelForge training pipeline.
 
-Primary: unsloth/Qwen3-Coder-30B-A3B-Instruct (30.5B MoE, 3.3B active)
-         via Unsloth FastLanguageModel + PatchFastRL for GRPO.
-         bf16 on H200 141GB (~61GB model, ~80GB free for vLLM + GRPO).
-         Unsloth's 2026 Faster MOE update handles MoE LoRA natively.
+Model selection is registry-driven from configs/scaling_ladder.json via
+KERNELFORGE_MODEL_LABEL. KERNELFORGE_MODEL remains an exact HF model override.
 
-Supports quantized loading via BitsAndBytes for A100/H100 80GB training.
-Set KERNELFORGE_QUANT_BITS=8 (recommended) or KERNELFORGE_QUANT_BITS=4 to enable.
-8-bit preserves more model accuracy than 4-bit with minimal extra VRAM.
+There is no fallback model. The loader always attempts to load the exact model
+chosen by the user and only falls back between loading backends for that same
+model.
 
-Dev:     Qwen2.5-Coder-0.5B-Instruct for macOS control-plane validation.
+Target-GPU support:
+- A100 / H100 80GB: bf16 or quantized loading
+- H200 141GB: bf16 primary path for larger models
 """
 from __future__ import annotations
 
 import os
 import sys
+
+from training.model_registry import resolve_model_selection
 
 TARGET_GPU = os.getenv("KERNELFORGE_TARGET_GPU", "A100")
 TARGET_ARCH = os.getenv("KERNELFORGE_TARGET_ARCH", "sm_80")
@@ -24,10 +25,6 @@ QUANT_BITS = int(os.getenv("KERNELFORGE_QUANT_BITS", "0"))
 # Legacy compat
 if os.getenv("KERNELFORGE_LOAD_IN_4BIT", "0") == "1" and QUANT_BITS == 0:
     QUANT_BITS = 4
-
-# Primary model (MoE via Unsloth)
-PRIMARY_MODEL = os.getenv("KERNELFORGE_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
-DEV_MODEL = os.getenv("KERNELFORGE_DEV_MODEL", "Qwen/Qwen2.5-Coder-0.5B-Instruct")
 
 # LoRA constants
 LORA_R = int(os.getenv("KERNELFORGE_LORA_R", "16"))
@@ -46,11 +43,19 @@ _model = None
 _tokenizer = None
 _model_type = None  # "moe" or "portable"
 _model_key = None
+_model_selection = None
+
+GPU_PROFILES = {
+    "A100": {"family": "ampere", "memory_gb": 80, "preferred_dtype": "bf16"},
+    "H100": {"family": "hopper", "memory_gb": 80, "preferred_dtype": "bf16"},
+    "H200": {"family": "hopper", "memory_gb": 141, "preferred_dtype": "bf16"},
+}
 
 
 def load_model_and_tokenizer(
     checkpoint_path: str | None = None,
     model_id: str | None = None,
+    model_label: str | None = None,
     load_in_4bit: bool | None = None,
     quant_bits: int | None = None,
 ):
@@ -59,13 +64,14 @@ def load_model_and_tokenizer(
     Args:
         checkpoint_path: Load from a fine-tuned checkpoint instead of base model.
         model_id: HuggingFace model ID to load (overrides KERNELFORGE_MODEL env var).
+        model_label: Registry label from configs/scaling_ladder.json.
         load_in_4bit: Legacy — use quant_bits=4 instead.
         quant_bits: Quantization bits (0=bf16, 4=NF4, 8=INT8). Overrides env var.
 
     Returns:
         (model, tokenizer) tuple ready for training.
     """
-    global _model, _tokenizer, _model_type, _model_key
+    global _model, _tokenizer, _model_type, _model_key, _model_selection
 
     # Resolve quantization: explicit param > legacy param > env var
     if quant_bits is not None:
@@ -75,7 +81,8 @@ def load_model_and_tokenizer(
     else:
         effective_quant = QUANT_BITS
 
-    resolved_model_id = model_id or PRIMARY_MODEL
+    resolved_model = resolve_model_selection(model_label=model_label, model_id=model_id)
+    resolved_model_id = resolved_model["model_id"]
     resolved_checkpoint = checkpoint_path if checkpoint_path and os.path.exists(checkpoint_path) else None
     quant_label = {0: "bf16", 4: "4bit", 8: "8bit"}.get(effective_quant, f"{effective_quant}bit")
     cache_key = resolved_checkpoint or f"{resolved_model_id}:{quant_label}"
@@ -85,21 +92,48 @@ def load_model_and_tokenizer(
     if resolved_checkpoint:
         _model, _tokenizer = _load_from_checkpoint(resolved_checkpoint, quant_bits=effective_quant)
         _model_key = cache_key
+        _model_selection = resolved_model
         return _model, _tokenizer
 
+    profile = get_target_gpu_profile()
+    print(
+        "Resolved runtime model: "
+        f"label={resolved_model['label']} model_id={resolved_model_id} "
+        f"source={resolved_model['source']} target_gpu={TARGET_GPU} "
+        f"target_arch={TARGET_ARCH} profile={profile['family']}/{profile['memory_gb']}GB"
+    )
+
     if sys.platform != "linux":
-        _model, _tokenizer = _load_portable_dev_model()
+        _model, _tokenizer = _load_selected_model_portable(
+            model_id=resolved_model_id,
+            quant_bits=effective_quant,
+        )
         _model_type = "portable"
     else:
         _model, _tokenizer = _load_primary(model_id=resolved_model_id, quant_bits=effective_quant)
         _model_type = "moe"
     _model_key = cache_key
+    _model_selection = resolved_model
     return _model, _tokenizer
 
 
 def get_model_type() -> str | None:
     """Return 'moe' or 'portable' depending on which model loaded."""
     return _model_type
+
+
+def get_model_selection() -> dict | None:
+    """Return the last resolved model selection metadata."""
+    return _model_selection
+
+
+def get_target_gpu_profile() -> dict[str, object]:
+    """Return the configured training GPU profile.
+
+    Keeps the A100/H100/H200 split explicit in code instead of collapsing them
+    into a single generic path.
+    """
+    return dict(GPU_PROFILES.get(TARGET_GPU.upper(), {"family": "unknown", "memory_gb": 0, "preferred_dtype": "bf16"}))
 
 
 def _make_bnb_config(quant_bits: int):
@@ -125,7 +159,9 @@ def _load_primary(model_id: str | None = None, quant_bits: int = 0):
     """Load MoE model via Unsloth FastLanguageModel (supports MoE since 2026)."""
     from unsloth import FastLanguageModel, PatchFastRL
 
-    effective_model = model_id or PRIMARY_MODEL
+    effective_model = model_id
+    if not effective_model:
+        raise ValueError("model_id must be provided; model selection is registry-driven.")
     quant_label = {0: "bf16", 4: "4bit", 8: "8bit"}.get(quant_bits, f"{quant_bits}bit")
 
     candidates: list[str] = []
@@ -140,7 +176,7 @@ def _load_primary(model_id: str | None = None, quant_bits: int = 0):
 
     last_error: Exception | None = None
     for candidate in candidates:
-        print(f"Loading primary model: {candidate} ({quant_label})")
+        print(f"Loading selected model via Unsloth: {candidate} ({quant_label})")
         try:
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=candidate,
@@ -174,9 +210,9 @@ def _load_primary(model_id: str | None = None, quant_bits: int = 0):
             return model, tokenizer
         except Exception as exc:
             last_error = exc
-            print(f"Primary model load failed for {candidate}: {str(exc)[:500]}")
+            print(f"Selected model load failed for {candidate}: {str(exc)[:500]}")
 
-    print("Falling back to Transformers + PEFT primary model loader")
+    print("Falling back to Transformers + PEFT for the same selected model")
     import torch
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -222,33 +258,67 @@ def _load_primary(model_id: str | None = None, quant_bits: int = 0):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(
-        f"Primary model loaded via Transformers + PEFT from {hf_model_name}: "
+        f"Selected model loaded via Transformers + PEFT from {hf_model_name}: "
         f"{trainable:,} trainable / {total:,} total params ({trainable / total * 100:.2f}%)"
     )
     return model, tokenizer
 
 
-def _load_portable_dev_model():
-    """Portable non-Linux fallback used for local control-plane validation."""
+def _load_selected_model_portable(model_id: str, quant_bits: int = 0):
+    """Portable non-Linux path for the exact selected model.
+
+    This does not switch models. If the selected model is too large for the host,
+    the load should fail loudly instead of silently swapping to a different one.
+    """
     import torch
+    from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print(f"Loading portable dev model: {DEV_MODEL}")
-    tokenizer = AutoTokenizer.from_pretrained(DEV_MODEL, trust_remote_code=True)
+    hf_model_name = model_id.split("/", 1)[1] if model_id.startswith("unsloth/") else model_id
+    quant_label = {0: "fp32", 4: "4bit", 8: "8bit"}.get(quant_bits, f"{quant_bits}bit")
+    print(f"Loading selected model on non-Linux host: {hf_model_name} ({quant_label})")
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_name, trust_remote_code=True)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
+    load_kwargs: dict = {
+        "trust_remote_code": True,
+        "torch_dtype": torch.float32,
+    }
+    bnb_config = _make_bnb_config(quant_bits)
+    if bnb_config is not None:
+        load_kwargs["quantization_config"] = bnb_config
+
     model = AutoModelForCausalLM.from_pretrained(
-        DEV_MODEL,
-        trust_remote_code=True,
-        torch_dtype=torch.float32,
+        hf_model_name,
+        **load_kwargs,
     )
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=LORA_TARGETS,
+            bias="none",
+        ),
+    )
+
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Portable dev model loaded: {trainable:,} trainable / {total:,} total params")
+    print(
+        f"Selected model loaded on non-Linux host: "
+        f"{trainable:,} trainable / {total:,} total params"
+    )
     return model, tokenizer
 
 

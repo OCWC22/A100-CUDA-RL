@@ -1,9 +1,5 @@
 """
-Stage 3: GRPO with Curriculum — hackathon pilot (50 steps).
-
-GPU split: H200 handles model weights + generation + gradient updates.
-           A100 (CoreWeave via Northflank) handles all performance reward.
-           You cannot optimize A100 performance by measuring on H200.
+Stage 3: GRPO with curriculum on the active A100 training/eval path.
 
 Multi-turn agentic training via TRL's rollout_func:
   - 3 turns per episode (hackathon default)
@@ -11,10 +7,8 @@ Multi-turn agentic training via TRL's rollout_func:
   - Temperature 0.7 for exploitation
   - LR 3e-6 (per GRPO-15.1 hackathon config)
   - 50 max_steps (hackathon pilot — only if Gate G-0.8 passes)
-  - G=2 (reduced from 4 — fewer zero-gradient steps)
-  - H200: local nvcc compile check (fast-fail syntax errors)
-  - A100 (CoreWeave/Northflank): execution correctness + speedup timing for reward
-  - Discrete reward {-1, 1, 2, 3} per CUDA Agent ablation
+  - Shared GRPO config with Stage 1: G=8, max_completion_length=1024
+  - A100: local compile fast-fail + remote correctness/speed evaluation
   - vLLM disabled by default for hackathon bring-up (`KERNELFORGE_USE_VLLM=0`)
 
 GRPO is experimental. SkyDiscover + SFT are primary hedges.
@@ -43,6 +37,11 @@ if sys.platform.startswith("linux"):
 from trl import GRPOConfig, GRPOTrainer
 
 from training.custom_grpo_trainer import TRLOOGRPOTrainer
+from training.grpo_config import (
+    apply_shared_grpo_runtime,
+    load_shared_grpo_runtime,
+    validate_shared_grpo_runtime,
+)
 from training.model_loader import load_model_and_tokenizer
 from training.curriculum import CurriculumManager, format_problem_prompt
 from training.dataset_loader import Dataset, MiniDataset, load_training_dataset
@@ -56,23 +55,13 @@ STAGE2_OUTPUT = os.getenv("KERNELFORGE_STAGE2_OUTPUT", "outputs/kernelforge-stag
 STAGE1_OUTPUT = os.getenv("KERNELFORGE_STAGE1_OUTPUT", "outputs/kernelforge-stage1")
 OUTPUT_DIR = os.getenv("KERNELFORGE_STAGE3_OUTPUT", "outputs/kernelforge-stage3")
 IS_LINUX = sys.platform.startswith("linux")
-USE_VLLM = os.getenv("KERNELFORGE_USE_VLLM", "0") == "1" and IS_LINUX
-VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("KERNELFORGE_VLLM_GPU_MEMORY_UTILIZATION", "0.6"))
-OPTIMIZER = "paged_adamw_8bit" if IS_LINUX else "adamw_torch"
-USE_BF16 = IS_LINUX
+GRPO_RUNTIME = load_shared_grpo_runtime("stage3")
 
 # Multi-turn configuration
 MAX_TURNS = int(os.getenv("KERNELFORGE_STAGE3_MAX_TURNS", "3"))
 MAX_STEPS = int(os.getenv("KERNELFORGE_STAGE3_MAX_STEPS", "50"))
-MAX_COMPLETION_LENGTH = int(os.getenv("KERNELFORGE_STAGE3_MAX_COMPLETION_LENGTH", "768"))
-VLLM_MODE = os.getenv("KERNELFORGE_VLLM_MODE", "server").strip().lower()
-VLLM_SERVER_BASE_URL = os.getenv("KERNELFORGE_VLLM_SERVER_BASE_URL", "").strip()
+MAX_COMPLETION_LENGTH = GRPO_RUNTIME.max_completion_length
 USE_TRLOO = os.getenv("KERNELFORGE_USE_TRLOO", "1") == "1"
-
-# GRPO config constants — used by both _validate_config() and grpo_kwargs
-PER_DEVICE_BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 4
-NUM_GENERATIONS = 2
 # Local compile check controlled by KERNELFORGE_LOCAL_COMPILE in multi_turn_rollout.py.
 # Set KERNELFORGE_LOCAL_COMPILE=0 to skip local compile pre-check (slower but simpler).
 
@@ -87,10 +76,17 @@ def reward_from_env_with_curriculum(completions, **kwargs) -> list[float]:
     if not env_rewards:
         return [-1.0] * len(completions)
 
-    rewards = [float(r) for r in env_rewards]
+    rewards: list[float] = []
+    for reward in env_rewards:
+        if reward is None:
+            rewards.append(float("nan"))
+            continue
+        rewards.append(float(reward))
 
     # Feed each reward to curriculum for promotion/demotion
     for r in rewards:
+        if not (r == r):
+            continue
         transition = curriculum.record_reward(r)
         if transition:
             print(f"  Curriculum transition: {transition} -> now in phase '{curriculum.phase_name}'")
@@ -135,21 +131,6 @@ def build_curriculum_dataset(num_prompts: int = 200) -> tuple[Dataset, list[dict
         sampled_rows.append(sampled)
     return _dataset_from_rows(prompts), sampled_rows
 
-
-def _validate_config():
-    effective_batch = PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
-    if effective_batch % NUM_GENERATIONS != 0:
-        raise ValueError(
-            f"Effective batch size ({effective_batch}) must be divisible by "
-            f"num_generations ({NUM_GENERATIONS}) per TRL GRPO requirement."
-        )
-    if USE_VLLM and VLLM_MODE == "server" and not VLLM_SERVER_BASE_URL:
-        raise ValueError(
-            "KERNELFORGE_USE_VLLM=1 with KERNELFORGE_VLLM_MODE=server requires "
-            "KERNELFORGE_VLLM_SERVER_BASE_URL to be set."
-        )
-
-
 # --- Training ---
 
 def main():
@@ -158,7 +139,14 @@ def main():
     print(f"  Starting phase: {curriculum.phase_name}")
     print(f"  Max turns per episode: {MAX_TURNS}")
     print(f"  Max training steps: {MAX_STEPS}")
+    print(f"  Max prompt length: {GRPO_RUNTIME.max_prompt_length}")
     print(f"  Max completion length: {MAX_COMPLETION_LENGTH}")
+    print(
+        "  Shared GRPO runtime: "
+        f"G={GRPO_RUNTIME.num_generations} "
+        f"batch={GRPO_RUNTIME.per_device_train_batch_size}x{GRPO_RUNTIME.gradient_accumulation_steps} "
+        f"(effective={GRPO_RUNTIME.effective_batch_size})"
+    )
 
     try:
         ops6k_max = int(os.getenv("KERNELFORGE_STAGE3_OPS6K_MAX", "128"))
@@ -189,24 +177,19 @@ def main():
         problem_metadata=sampled_rows,
     )
 
-    _validate_config()
+    validate_shared_grpo_runtime(GRPO_RUNTIME)
 
-    grpo_kwargs = dict(
+    grpo_kwargs = apply_shared_grpo_runtime(
+        GRPO_RUNTIME,
+        dict(
         learning_rate=3e-6,
         temperature=0.7,
-        num_generations=NUM_GENERATIONS,
         num_iterations=1,
         beta=0.0,                        # No ref model — saves memory
         epsilon=0.2,
         scale_rewards="batch",           # Better for sparse expensive env
         remove_unused_columns=False,     # Custom rollout needs extra columns
-        max_prompt_length=3072,
-        max_completion_length=MAX_COMPLETION_LENGTH,
-        per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         max_steps=MAX_STEPS,
-        optim=OPTIMIZER,
-        bf16=USE_BF16,
         gradient_checkpointing=True,
         report_to="none",
         output_dir=OUTPUT_DIR,
@@ -216,14 +199,8 @@ def main():
         top_k=50,
         top_p=0.95,
         repetition_penalty=1.05,
+        ),
     )
-    if USE_VLLM:
-        grpo_kwargs["use_vllm"] = True
-        grpo_kwargs["vllm_mode"] = VLLM_MODE
-        if VLLM_MODE == "server":
-            grpo_kwargs["vllm_server_base_url"] = VLLM_SERVER_BASE_URL
-        elif VLLM_MODE == "colocate":
-            grpo_kwargs["vllm_gpu_memory_utilization"] = VLLM_GPU_MEMORY_UTILIZATION
 
     config = GRPOConfig(**grpo_kwargs)
 

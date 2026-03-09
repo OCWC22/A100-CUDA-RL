@@ -2,6 +2,7 @@
 import pytest
 
 from openenv_env.reward import compute_reward, trloo_post_process
+from training.task_support import build_reward_contract
 
 
 def test_compile_fail():
@@ -65,6 +66,107 @@ def test_beats_torch_compile():
     """speedup_vs_compile=1.2 > 1.05 -> reward 3.0."""
     r = compute_reward(compiled=True, correct=True, speedup_vs_eager=2.0, speedup_vs_compile=1.2)
     assert r == 3.0
+
+
+def test_dense_reward_masks_backend_failures():
+    contract = build_reward_contract(
+        {"backend_error": True, "error": "Modal backend timeout"},
+        backend_error=True,
+    )
+    assert contract["valid_for_loss"] is False
+    assert contract["training_reward"] is None
+    assert contract["public_reward_bucket"] is None
+    assert contract["termination_reason"] == "backend_error"
+
+
+def test_dense_reward_no_code():
+    contract = build_reward_contract(
+        {"error": "No code found"},
+        extraction_status="no_code",
+    )
+    assert contract["training_reward"] == -1.0
+    assert contract["public_reward_bucket"] == -1
+    assert contract["termination_reason"] == "no_code"
+
+
+def test_dense_reward_truncated_partial():
+    contract = build_reward_contract(
+        {"error": "generation clipped"},
+        truncated=True,
+        extraction_status="truncated_partial",
+    )
+    assert contract["training_reward"] == -0.7
+    assert contract["public_reward_bucket"] == -1
+    assert contract["termination_reason"] == "truncated_partial"
+
+
+def test_dense_reward_local_compile_fail():
+    contract = build_reward_contract(
+        {"error": "nvcc: expected ';'"},
+        local_compile_ok=False,
+    )
+    assert contract["training_reward"] == -0.5
+    assert contract["termination_reason"] == "local_compile_fail"
+
+
+def test_dense_reward_remote_compile_fail():
+    contract = build_reward_contract(
+        {"compiles": False, "correct": False, "error": "Compilation failed"},
+    )
+    assert contract["training_reward"] == -0.4
+    assert contract["termination_reason"] == "remote_compile_fail"
+
+
+def test_dense_reward_runtime_error():
+    contract = build_reward_contract(
+        {"compiles": True, "correct": False, "error": "Profiling failed: CUDA launch failed"},
+    )
+    assert contract["training_reward"] == -0.3
+    assert contract["termination_reason"] == "runtime_error"
+
+
+def test_dense_reward_correctness_fail():
+    contract = build_reward_contract(
+        {"compiles": True, "correct": False, "error": "Correctness check failed: mismatch"},
+    )
+    assert contract["training_reward"] == -0.2
+    assert contract["termination_reason"] == "correctness_fail"
+
+
+def test_dense_reward_correct_slow():
+    contract = build_reward_contract(
+        {"compiles": True, "correct": True, "speedup_vs_orig": 0.75, "speedup_vs_dg": 0.5},
+    )
+    assert contract["training_reward"] == 0.2
+    assert contract["public_reward_bucket"] == 1
+    assert contract["termination_reason"] == "correct_slow"
+
+
+def test_dense_reward_correct_parity():
+    contract = build_reward_contract(
+        {"compiles": True, "correct": True, "speedup_vs_orig": 1.01, "speedup_vs_dg": 1.0},
+    )
+    assert contract["training_reward"] == 0.4
+    assert contract["public_reward_bucket"] == 1
+    assert contract["termination_reason"] == "correct_parity"
+
+
+def test_dense_reward_correct_fast_eager():
+    contract = build_reward_contract(
+        {"compiles": True, "correct": True, "speedup_vs_orig": 1.2, "speedup_vs_dg": 0.95},
+    )
+    assert contract["training_reward"] == 0.7
+    assert contract["public_reward_bucket"] == 2
+    assert contract["termination_reason"] == "correct_fast_eager"
+
+
+def test_dense_reward_correct_fast_compile():
+    contract = build_reward_contract(
+        {"compiles": True, "correct": True, "speedup_vs_orig": 1.3, "speedup_vs_dg": 1.2},
+    )
+    assert contract["training_reward"] == 1.0
+    assert contract["public_reward_bucket"] == 3
+    assert contract["termination_reason"] == "correct_fast_compile"
 
 
 def test_trloo_post_process_g4():
