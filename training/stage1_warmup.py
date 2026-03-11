@@ -68,6 +68,21 @@ def _dataset_from_rows(rows: list[dict]) -> Dataset:
     return MiniDataset(rows)
 
 
+CUDA_SYSTEM_PROMPT = (
+    "You are a CUDA kernel engineer. Output ONLY the CUDA C++ code inside a "
+    "```cuda code block. No explanation, no markdown outside the code block, "
+    "no commentary. The code must be a complete, compilable CUDA kernel."
+)
+
+
+def _wrap_prompt_as_chat(prompt_text: str) -> list[dict[str, str]]:
+    """Wrap a raw prompt string as chat messages with system instruction."""
+    return [
+        {"role": "system", "content": CUDA_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt_text},
+    ]
+
+
 def load_stage1_dataset() -> Dataset:
     """Load stage1 prompts from unified dataset loader, with safe fallback."""
 
@@ -79,7 +94,13 @@ def load_stage1_dataset() -> Dataset:
             seed=42,
         )
         if len(ds) > 0:
-            print(f"Loaded {len(ds)} unified Stage 1 prompts")
+            # Wrap string prompts as chat messages for better code-only output
+            rows = ds.to_list() if hasattr(ds, "to_list") else list(ds)
+            for row in rows:
+                if isinstance(row.get("prompt"), str):
+                    row["prompt"] = _wrap_prompt_as_chat(row["prompt"])
+            ds = _dataset_from_rows(rows)
+            print(f"Loaded {len(ds)} unified Stage 1 prompts (chat format)")
             return ds.shuffle(seed=42) if hasattr(ds, "shuffle") else ds
     except Exception as e:
         print(f"Could not load Ops-6K for Stage 1: {e}")
@@ -87,7 +108,7 @@ def load_stage1_dataset() -> Dataset:
     print("Using fallback Stage 1 prompts with live WCC evaluation support")
     return _dataset_from_rows([
         {
-            "prompt": (
+            "prompt": _wrap_prompt_as_chat(
                 f"Write a CUDA Weakly Connected Components kernel for {TARGET_GPU} ({TARGET_ARCH}) "
                 "using union-find with path compression."
             ),
@@ -96,7 +117,7 @@ def load_stage1_dataset() -> Dataset:
             "data_source": "fallback_wcc",
         },
         {
-            "prompt": (
+            "prompt": _wrap_prompt_as_chat(
                 f"Write a CUDA Weakly Connected Components kernel for {TARGET_GPU} ({TARGET_ARCH}) "
                 "optimized for sparse disconnected graphs with early convergence."
             ),
@@ -105,7 +126,7 @@ def load_stage1_dataset() -> Dataset:
             "data_source": "fallback_wcc",
         },
         {
-            "prompt": (
+            "prompt": _wrap_prompt_as_chat(
                 f"Write a CUDA Weakly Connected Components kernel for {TARGET_GPU} ({TARGET_ARCH}) "
                 "using shared memory staging for dense frontiers."
             ),

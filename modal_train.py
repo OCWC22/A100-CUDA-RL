@@ -126,8 +126,8 @@ def train(
     if model_label:
         os.environ["KERNELFORGE_MODEL_LABEL"] = model_label
     os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_2b")
-    os.environ.setdefault("KERNELFORGE_LORA_R", "64")
-    os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
+    os.environ.setdefault("KERNELFORGE_LORA_R", "16")
+    os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "16")
     # Skip Unsloth patching — Qwen 3.5 RoPE bug in unsloth compiled module.
     os.environ.setdefault("KERNELFORGE_SKIP_UNSLOTH", "1")
     if stage in {0, 1}:
@@ -162,9 +162,11 @@ def train(
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_TURNS", "1")
         os.environ.setdefault("CUDA_AGENT_STAGE1_SAMPLES", "100")
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "1024")
-        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "4")
-        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "4")
+        os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "2")
+        os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "2")
         os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "1")
+        # QLoRA: 4-bit base model for faster inference with 9B+ models
+        os.environ.setdefault("KERNELFORGE_QUANT_BITS", "4")
         if max_steps is None:
             os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
         print(
