@@ -181,6 +181,8 @@ def make_cuda_reward_func(task_rows: list[dict]):
         for i, completion in enumerate(completions):
             try:
                 completion_text = _to_text(completion)
+                if i == 0:  # Log first completion for debugging
+                    print(f"  [reward] completion[0] preview: {completion_text[:300]!r}", flush=True)
                 cuda_code = extract_cuda_code(completion_text)
 
                 # Dense reward for different failure modes
@@ -203,9 +205,10 @@ def make_cuda_reward_func(task_rows: list[dict]):
                     continue
 
                 # Find the matching task row for this prompt
+                # normalize_task_row keys on str(prompt), so match using str() for chat-format lists
                 prompt_raw = prompts[i] if prompts else ""
-                prompt_text = _to_text(prompt_raw)
-                task_row = normalize_task_row(prompt_lookup.get(prompt_text, {"prompt": prompt_text}))
+                prompt_key = str(prompt_raw).strip()
+                task_row = normalize_task_row(prompt_lookup.get(prompt_key, {"prompt": _to_text(prompt_raw)}))
 
                 result = evaluate_code_remote(
                     cuda_code,
