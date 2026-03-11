@@ -37,7 +37,8 @@ train_image = (
     .apt_install("g++", "ninja-build")
     # Fast linear attention for Qwen 3.5 Mamba-style layers — REQUIRED for 9B model.
     # Without this, the PyTorch fallback hangs during GRPO batched generation (G>1).
-    .pip_install("causal-conv1d>=1.4.0")
+    # Build only for sm_80 (A100) to avoid Modal output rate limit from verbose ptxas logs.
+    .run_commands("TORCH_CUDA_ARCH_LIST='8.0' pip install 'causal-conv1d>=1.4.0' 2>&1 | tail -20")
     # Unsloth with full deps (caps trl<=0.24.0, datasets<4.4.0).
     .pip_install("unsloth==2026.3.4", "unsloth_zoo")
     # Training stack — transformers 5.2.0 needed for Qwen 3.5 architecture.
