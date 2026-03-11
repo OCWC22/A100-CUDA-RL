@@ -20,7 +20,7 @@ import modal
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100-80GB")
+TRAIN_GPU = os.getenv("KERNELFORGE_TRAIN_GPU", "A100")
 APP_NAME = os.getenv("KERNELFORGE_TRAIN_APP", "kernelforge-train")
 EVAL_APP_NAME = os.getenv("KERNELFORGE_MODAL_APP", "kernelforge-a100")
 
@@ -122,11 +122,15 @@ def train(
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"CUDA: {torch.version.cuda}")
 
-    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "modal")
+    # Local eval for now — verify GRPO training works before switching to modal.
+    os.environ.setdefault("KERNELFORGE_EVAL_BACKEND", "local")
     os.environ.setdefault("KERNELFORGE_MODAL_APP", EVAL_APP_NAME)
     if model_label:
         os.environ["KERNELFORGE_MODEL_LABEL"] = model_label
-    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_9b")
+    # Use 2B model by default — 9B Qwen 3.5 Mamba layers hang during GRPO
+    # batched generation without causal-conv1d. Use --model-label opus_9b after
+    # installing causal-conv1d or enabling vLLM.
+    os.environ.setdefault("KERNELFORGE_MODEL_LABEL", "opus_2b")
     os.environ.setdefault("KERNELFORGE_LORA_R", "64")
     os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
     # Skip Unsloth patching — Qwen 3.5 RoPE bug in unsloth compiled module.
