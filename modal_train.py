@@ -131,9 +131,9 @@ def train(
     os.environ.setdefault("KERNELFORGE_LORA_ALPHA", "64")
     # Skip Unsloth patching — Qwen 3.5 RoPE bug in unsloth compiled module.
     os.environ.setdefault("KERNELFORGE_SKIP_UNSLOTH", "1")
-    # INT8 quantization: frees ~9GB VRAM (18GB bf16 → 9GB INT8) for larger batches.
-    # INT8 is well-tested and much better than 4-bit for code generation quality.
-    os.environ.setdefault("KERNELFORGE_QUANT_BITS", "8")
+    # Quantization: off by default (bf16). INT8 caused first-step hangs in GRPO
+    # batched generation (G=4). Enable with KERNELFORGE_QUANT_BITS=8 after verifying.
+    os.environ.setdefault("KERNELFORGE_QUANT_BITS", "0")
     if stage in {0, 1}:
         os.environ.setdefault("KERNELFORGE_SKIP_BENCHMARK", "1")
         os.environ.setdefault("KERNELFORGE_DEBUG_TIMINGS", "1")
@@ -168,7 +168,7 @@ def train(
         os.environ.setdefault("KERNELFORGE_STAGE1_MAX_COMPLETION_LENGTH", "2048")
         os.environ.setdefault("KERNELFORGE_STAGE1_NUM_GENERATIONS", "4")
         os.environ.setdefault("KERNELFORGE_STAGE1_PER_DEVICE_BATCH_SIZE", "1")
-        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "8")
+        os.environ.setdefault("KERNELFORGE_STAGE1_GRADIENT_ACCUMULATION_STEPS", "4")
         if max_steps is None:
             os.environ.setdefault("KERNELFORGE_STAGE1_MAX_STEPS", "5")
         print(
